@@ -2,6 +2,7 @@
 require "logstash/inputs/base"
 require "logstash/namespace"
 require "base64"
+require "yaml"
 
 # .Compatibility Note
 # [NOTE]
@@ -10,9 +11,9 @@ require "base64"
 # called `http.content_type.required`. If this option is set to `true`, and you
 # are using Logstash 2.4 through 5.2, you need to update the Elasticsearch input
 # plugin to version 4.0.2 or higher.
-# 
+#
 # ================================================================================
-# 
+#
 # Read from an Elasticsearch cluster, based on search query results.
 # This is useful for replaying test logs, reindexing, etc.
 #
@@ -63,6 +64,8 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
   # round trip (i.e. between the previous scroll request, to the next).
   config :scroll, :validate => :string, :default => "1m"
 
+  config :legacy_scrolling, :validate => :boolean, :default => false
+
   # If set, include Elasticsearch document information such as index, type, and
   # the id in the event.
   #
@@ -111,11 +114,30 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
   # SSL
   config :ssl, :validate => :boolean, :default => false
 
-  # SSL Certificate Authority file in PEM encoded format, must also include any chain certificates as necessary 
+  # SSL Certificate Authority file in PEM encoded format, must also include any chain certificates as necessary
   config :ca_file, :validate => :path
+
+  # Path to file with last run time
+  config :last_run_metadata_path, :validate => :string, :default => "#{ENV['HOME']}/.logstash_elastic_last_run"
+  # If tracking column value rather than timestamp, the column whose value is to be tracked
+  config :tracking_field, :validate => :string
+  # Type of tracking column. Currently only "numeric" and "timestamp"
+  config :tracking_field_type, :validate => ['numeric', 'timestamp'], :default => 'numeric'
+  # Whether the previous run state should be preserved
+  config :clean_run, :validate => :boolean, :default => false
+  # Whether to save state or not in last_run_metadata_path
+  config :record_last_run, :validate => :boolean, :default => false
+
+  # Schedule of when to periodically run statement, in Cron format
+  # for example: "* * * * *" (execute query every minute, on the minute)
+  #
+  # There is no schedule by default. If no schedule is given, then the statement is run
+  # exactly once.
+  config :schedule, :validate => :string
 
   def register
     require "elasticsearch"
+    require "rufus/scheduler"
 
     @options = {
       :index => @index,
@@ -123,6 +145,24 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
       :scroll => @scroll,
       :size => @size
     }
+
+    # Raise an error if @use_column_value is true, but no @tracking_column is set
+    if @use_field_value
+      if @tracking_field.nil?
+        raise(LogStash::ConfigurationError, "Must set :tracking_field if :use_field_value is true.")
+      end
+    end
+
+    # load sql_last_value from file if exists
+    @elastic_last_value = 0
+    @elastic_last_page_value = -1
+    if @clean_run && File.exist?(@last_run_metadata_path)
+      File.delete(@last_run_metadata_path)
+    elsif File.exist?(@last_run_metadata_path)
+      @elastic_last_value = YAML.load(File.read(@last_run_metadata_path))
+      logger.info("using elastic_last_value #{@elastic_last_value}")
+    end
+
 
     transport_options = {}
 
@@ -145,24 +185,67 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
     end
 
     @client = Elasticsearch::Client.new(:hosts => hosts, :transport_options => transport_options)
+
   end
 
-  def run(output_queue)
+  def update_state_file
+
+    if @record_last_run
+      File.write(@last_run_metadata_path, YAML.dump(@elastic_last_value))
+      if @elastic_last_value == @elastic_last_page_value
+        false
+      else
+        @elastic_last_page_value = @elastic_last_value
+        true
+      end
+    else
+      true
+    end
+  end
+
+
+  def execute_query(output_queue)
     # get first wave of data
+    if @record_last_run
+      updatedquery = @query.sub("&elastic_last_value", @elastic_last_value.to_s)
+      @options = {
+          :index => @index,
+          :body => updatedquery,
+          :scroll => @scroll,
+          :size => @size
+      }
+
+    end
     r = @client.search(@options)
 
     r['hits']['hits'].each { |hit| push_hit(hit, output_queue) }
     has_hits = r['hits']['hits'].any?
+    update_state_file
 
     while has_hits && !stop?
       r = process_next_scroll(output_queue, r['_scroll_id'])
-      has_hits = r['has_hits']
+      u = update_state_file
+      has_hits = u && r['has_hits']
+    end
+  end
+
+  def run(output_queue)
+   if @schedule
+      @scheduler = Rufus::Scheduler.new(:max_work_threads => 1)
+      @scheduler.cron @schedule do
+        execute_query(output_queue)
+      end
+
+      @scheduler.join
+    else
+      execute_query(output_queue)
     end
   end
 
   private
 
   def process_next_scroll(output_queue, scroll_id)
+    @logger.info("process new scroll")
     r = scroll_request(scroll_id)
     r['hits']['hits'].each { |hit| push_hit(hit, output_queue) }
     {'has_hits' => r['hits']['hits'].any?, '_scroll_id' => r['_scroll_id']}
@@ -170,6 +253,13 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
 
   def push_hit(hit, output_queue)
     event = LogStash::Event.new(hit['_source'])
+    decorate(event)
+
+    if @record_last_run
+      if !hit['_source'][tracking_field].nil? && hit['_source'][tracking_field] >  @elastic_last_value
+         @elastic_last_value = hit['_source'][tracking_field]
+      end
+    end
 
     if @docinfo
       # do not assume event[@docinfo_target] to be in-place updatable. first get it, update it, then at the end set it in the event.
@@ -189,12 +279,14 @@ class LogStash::Inputs::Elasticsearch < LogStash::Inputs::Base
       event.set(@docinfo_target, docinfo_target)
     end
 
-    decorate(event)
-
     output_queue << event
   end
 
   def scroll_request scroll_id
-    @client.scroll(:body => { :scroll_id => scroll_id }, :scroll => @scroll)
+    if @legacy_scrolling
+      @client.scroll(:body => scroll_id , :scroll => @scroll)
+    else
+      @client.scroll(:body => { :scroll_id => scroll_id }, :scroll => @scroll)
+    end
   end
 end
